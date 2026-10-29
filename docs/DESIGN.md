@@ -112,6 +112,11 @@ average:
   twice.
 - We never raise the learned timeout off the back of a failure - only
   lower it.
+- A heartbeat that times out on a `poor`-quality link is *not* fed into the
+  EMA: there, a missing ack is as likely to be packet loss as NAT eviction,
+  and learning from it would ratchet the timeout down (and battery use up)
+  on exactly the networks where both are scarcest. The connection is still
+  torn down and reconnected.
 - To avoid permanently converging to the single worst network a device has
   ever seen (and then over-heartbeating forever on a generous network), we
   cautiously **probe upward** after a run of clean heartbeat cycles, using a
@@ -119,9 +124,21 @@ average:
   drop, immediately re-detected and re-corrected) while a *missing* probe
   costs ongoing battery.
 
+- Only heartbeats sent on the regular schedule count toward the upward
+  probe. Early probes (from BLE liveness or a late intent ack, 2.3/2.5)
+  fire at shorter idle times, so their success says nothing about whether
+  the timeout could be longer.
+
 This is an intentionally asymmetric trade-off: fast to tighten, slow to
 loosen. See `learnIdleTimeoutDown()` / `maybeProbeTimeoutUpward()` in
 `adaptiveConnectionManager.ts`.
+
+**Known limitation:** the reference implementation keeps one learned value
+per manager instance. A wifi -> cellular handoff therefore starts from the
+previous network's value and re-learns (one silent drop on the way down,
+slow probing on the way up). A production client should key the learned
+timeout by network identity (wifi BSSID, or carrier + cell for mobile) and
+restore it on return to a known network - see Part 4.4.
 
 ### 2.2 Adaptive heartbeat / keep-alive strategy
 
@@ -146,7 +163,12 @@ idle timeout**, minus additional jitter (up to 2s by default):
 
 On any detected failure (clean close, error, or heartbeat timeout):
 
-1. Enter `reconnecting` state, increment the attempt counter.
+1. Enter `reconnecting` state, increment the attempt counter. The counter
+   (and so the backoff ceiling) resets only on the first *heartbeat ack*
+   of a new connection, not on socket open: a carrier can accept the TCP
+   handshake and blackhole the session seconds later, and resetting on
+   open would let that connect-then-die loop retry at base delay forever.
+   An `onerror` followed by `onclose` counts as one failure, not two.
 2. Compute delay via **full-jitter exponential backoff**: `delay =
    random(0, min(maxBackoff, base * 2^attempt * qualityMultiplier))`. Full
    jitter (not "exponential +/- a little") is deliberate: if a shared piece
@@ -157,19 +179,57 @@ On any detected failure (clean close, error, or heartbeat timeout):
    conditions (1.6x) and moderately under `fair` (1.2x) - retrying
    aggressively into a link that's already struggling just burns battery
    and radio time for more failures.
-4. On reconnect, **resume** is implicit and stateless-by-design on the
-   client: there's no sequence-number negotiation handshake required before
-   resuming, because...
-5. **Replay** is handled by the outbox (2.5), not by the socket layer: on
-   every successful `connected` transition, every outbox item still
-   unacked is re-sent, oldest first. The backend's intent processing is
-   idempotent (keyed by the intent's client-generated id), so a duplicate
-   send from an ack that was itself lost in-flight is safe to re-process.
-6. Two external signals can **pull a pending backoff forward** rather than
+4. **Resume (server -> client).** Every server event carries a monotonic
+   `seq`. The client persists the highest `seq` it has handled
+   (`EventCursor`) and opens every connection with
+   `{type: 'resume', lastEventSeq}`; the backend replays everything after
+   it, so an event pushed into a silently dead socket is delivered on the
+   next connection rather than lost. Details:
+   - Events are accepted strictly in order. Duplicates (replay overlapping
+     what we have) are dropped; a gap triggers one fresh `resume` rather
+     than out-of-order delivery.
+   - The cursor is advanced *after* listeners run, so a crash in between
+     re-delivers that event on restart: delivery is **at-least-once**, and
+     consumers dedupe by `seq`.
+   - Acks are batched: one `event-ack` for the highest `seq` per second,
+     which lets the backend trim its log without a radio write per event.
+   - A fresh install resumes with `null` and the backend answers with
+     `stream-head`, so the client has a cursor from its first connection
+     and can recover even its first lost event.
+   - If the client is further behind than the backend retains, the
+     backend sends `resync-required` with the oldest `seq` it still has;
+     the client emits `resyncRequired` (so the app can refresh state over
+     REST) and continues from there instead of silently skipping events.
+5. **Replay (client -> server)** is handled by the outbox, not the socket
+   layer: on every `connected` transition, every outbox item still unacked
+   is re-sent, oldest first. The backend's intent processing is idempotent,
+   keyed by the intent's id - a random UUID, so it stays unique across
+   devices and reinstalls - so a duplicate send after a lost ack is safe.
+   Intent delivery has two distinct steps:
+   - `intent-ack`: the backend has durably received it. The outbox item is
+     removed only at this point.
+   - `intent-result` (`executed`, or `rejected` with a reason): the
+     outcome, sent on the sequenced event stream - so a result lost in a
+     disconnect is replayed on resume like any other event.
+   Intents can carry a TTL (`sendIntent(payload, {ttlMs})`). An intent
+   whose `validUntil` passes before it's acked is dropped from the outbox
+   and reported via `intentExpired` rather than replayed late into a closed
+   flash sale; the backend checks `validUntil` too, and its
+   `intent-result` is the source of truth if an intent expired locally
+   while already in flight.
+6. **Per-intent ack deadline.** If a sent intent isn't acked within 5s, the
+   manager sends a heartbeat immediately rather than waiting for the next
+   scheduled one, which could be minutes away on a generous network. A
+   dead path is then detected in deadline + ack timeout, and the intent is
+   replayed on the new connection.
+7. Two external signals can **pull a pending backoff forward** rather than
    making the user wait it out: entering a protected window
    (`protect()`) and a BLE liveness signal from the watch
    (`notifyBleLiveness()`) - both are evidence the user is actively present
-   and a fast reconnect is worth the extra radio wake-up.
+   and a fast reconnect is worth the extra radio wake-up. Pull-forwards are
+   rate-limited (at most one per 5s): during a real outage the watch keeps
+   reporting liveness, and honouring every signal would turn backoff into a
+   reconnect storm.
 
 ### 2.4 Integration with foreground service / companion device APIs
 
@@ -207,12 +267,16 @@ map to:
   double-tap), which the relay layer hands to
   `AdaptiveConnectionManager.sendIntent()`, and (b) **liveness**, a cheap,
   frequent "still on wrist / still in range" signal that the relay layer
-  forwards to `notifyBleLiveness()`. Liveness is treated as *corroborating*
-  evidence, not a substitute for a real phone-side heartbeat: it nudges an
-  about-to-fire heartbeat slightly later (avoid waking the radio twice back
-  to back) and, if we're mid-backoff, pulls reconnection forward
-  immediately, since the presence of an engaged user raises the value of a
-  fast reconnect well above its battery cost.
+  forwards to `notifyBleLiveness()`. Liveness says the user is present; it
+  says nothing about the phone's carrier NAT mapping, so it **never delays
+  a heartbeat** (a frequent liveness signal that postponed heartbeats would
+  starve them entirely and guarantee an idle-timeout drop). What it changes
+  is how much fast failure detection is worth, since an intent may be
+  seconds away:
+  - **Connected but quiet** for more than half the learned idle timeout:
+    send a heartbeat now (at most one per 10s), so a dead path is found
+    before the user double-taps rather than after.
+  - **Mid-backoff:** pull the reconnect forward (rate-limited, 2.3 item 7).
 
 ---
 
@@ -229,18 +293,26 @@ Backend emits "Flash sale - 12 units left"
   -> User double-taps
   -> Watch sends the intent back over BLE
   -> Relay layer calls sendIntent(payload)
-  -> Outbox durably persists it, then an immediate send is attempted
-  -> If connected: backend acks -> intentAcked -> watch shows confirmation
+  -> Outbox durably persists it (with the offer's TTL), then sends it
+  -> Backend: intent-ack -> intentAcked -> watch shows "sent"
+  -> Backend executes: intent-result -> intentResult -> watch shows
+     "bought" or "sold out / expired"
 ```
 
 **Phone process frozen mid-flow** (the scenario the brief calls out
 explicitly): the sequence is identical up through "Outbox durably persists
-it" - `Outbox.enqueue()` performs a synchronous `fs.writeFileSync` before
-`sendIntent()` returns (see `outbox.ts`), specifically so that the intent is
-safe on disk *before* control returns to a caller that might be killed a
-moment later. If the OEM killer freezes/kills the process right after that:
+it" - `Outbox.enqueue()` writes synchronously before `sendIntent()` returns
+(see `outbox.ts`), specifically so that the intent is safe on disk *before*
+control returns to a caller that might be killed a moment later. The write
+is atomic (temp file, fsync, rename), so a kill *during* the write leaves
+the previous complete file rather than a truncated one; a file that is
+corrupt anyway is moved aside and reported (`outboxCorrupt`), never
+silently replaced by an empty queue. If the OEM killer freezes/kills the
+process right after that:
 
 - Nothing is lost - the intent sits on disk, not just in memory.
+- If its TTL ran out while the process was dead, it is reported via
+  `intentExpired` on restart instead of being replayed late.
 - When the process is next resumed (OS wakes it for a push, or the user
   reopens the app), `AdaptiveConnectionManager`'s constructor reloads the
   outbox from disk and `connect()` is called as part of normal startup.
@@ -254,11 +326,17 @@ the send either silently vanishes (full NAT drop) or times out waiting for
 an ack neither of which raises an immediate error. The outbox item is
 *not* removed until an explicit `intent-ack` arrives, so:
 
-- The next heartbeat cycle detects the dead connection (2.1/2.3) within one
-  bounded heartbeat-interval + ack-timeout window, not an indefinite hang.
+- The per-intent ack deadline (2.3 item 6) probes the connection
+  immediately, so the drop is detected within deadline + ack timeout
+  (5s + 8s at defaults on a good network, both tunable), not whenever the
+  next scheduled heartbeat happens to fire - which on a generous network
+  can be several minutes away.
 - Reconnection + outbox replay (above) recovers the intent automatically,
   with no special-casing needed for "was this a process freeze or a network
   drop" - both converge on the same recovery path.
+- If the drop instead lands between the ack and the result, the result is
+  replayed on resume (2.3 item 4); the backend's idempotency means the
+  intent is executed once either way.
 
 ---
 
@@ -268,7 +346,7 @@ an ack neither of which raises an immediate error. The outbox item is
 |---|---|---|---|
 | 1 | **Aggressive, variable NAT idle eviction** (30s on some carriers, much longer on others, and inconsistent even within one carrier under load) | Pre-paid/budget carrier infrastructure runs NAT tables under heavy subscriber-per-IP pressure; conservative idle timeouts save them carrier-side state. | EMA-learned, per-connection idle timeout with a fast-tighten/slow-loosen heartbeat (2.1/2.2), rather than one fixed interval tuned for a single carrier. |
 | 2 | **OEM background killers freezing the process** (Transsion, Xiaomi, and similar skins kill backgrounded apps aggressively to protect battery-life benchmarks, sometimes *despite* a running foreground service) | These OEMs dominate the region's device mix and compete heavily on advertised battery life, which incentivizes very aggressive, sometimes non-standard, background-kill heuristics. | `protect()`/`unprotect()` integration with real foreground-service + CompanionDeviceManager semantics (2.4); a disk-persisted outbox so a kill never loses an intent (3); diagnostics to detect OEM-specific freeze patterns (see Part 3, item 2). |
-| 3 | **High-latency / lossy 2G-3G links** (intents or heartbeats delayed seconds, or dropped outright, especially outside major metro coverage) | Coverage outside Lagos/Nairobi/Accra-tier metros is frequently 2G/3G-only, and even metro 4G degrades hard indoors or at cell-edge during peak hours. | `reportNetworkQuality()` widens the heartbeat ack-timeout tolerance and biases heartbeats more frequent under `poor`, while *also* backing off reconnection more aggressively (quality-aware backoff, 2.3) so we don't hammer an already-struggling link. |
+| 3 | **High-latency / lossy 2G-3G links** (intents or heartbeats delayed seconds, or dropped outright, especially outside major metro coverage) | Coverage outside Lagos/Nairobi/Accra-tier metros is frequently 2G/3G-only, and even metro 4G degrades hard indoors or at cell-edge during peak hours. | `reportNetworkQuality()` widens the heartbeat ack timeout (1.5x on `fair`, 2.5x on `poor`) so a slow-but-healthy link isn't torn down, biases heartbeats more frequent under `poor`, and stops treating a `poor`-network ack timeout as NAT evidence (it still reconnects, but doesn't lower the learned timeout - see 2.1). Reconnection also backs off more aggressively (quality-aware backoff, 2.3) so we don't hammer an already-struggling link. |
 | 4 | **Intermittent connectivity / frequent handoffs** (wifi<->cellular switches in homes/offices with unreliable wifi, or cell-tower handoffs on the move) | Shared/metered home and office wifi is common and frequently drops; commuting on packed transit causes frequent tower handoffs. | Every handoff looks like "connection died" to the manager, which is exactly the case the backoff+replay path already handles - no special-case needed, which keeps the failure surface small. The EMA's upward probe (2.1) also means a handoff onto a *better* network (e.g. wifi) is detected and exploited (less frequent heartbeats) rather than staying pinned to the worst network seen that session. |
 | 5 | **Battery-saver / data-saver OS modes triggered more aggressively** (many users run with Android's Battery Saver or Data Saver on by default, due to device cost/charging-access constraints and expensive mobile data) | Device and data costs are a larger share of income here, so users lean on these OS power/data-saving modes far more than in markets where they're an edge case. | The connection manager treats these the same as "OEM freeze risk" from the platform's point of view - `protect()` is the one integration point that has to account for Battery Saver's additional restrictions on top of OEM-specific ones, keeping the core manager logic unaware of *which* restriction is in play (see Part 4.1 for the related product trade-off). |
 
@@ -276,5 +354,7 @@ an ack neither of which raises an immediate error. The outbox item is
 
 *See `README.md` for how to run the demo harness that exercises most of
 this document's claims (idle-timeout learning, silent-drop detection,
-quality-aware backoff, BLE-liveness-pulls-reconnect, protect/unprotect) end
-to end, and `PART_3_AND_4.md` for the debugging and trade-off answers.*
+quality-aware ack timeout and backoff, event resume after a silent drop,
+intent ack/result and TTL expiry, BLE-liveness-pulls-reconnect,
+protect/unprotect) end to end, and `PART_3_AND_4.md` for the debugging and
+trade-off answers.*

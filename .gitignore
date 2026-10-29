@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Outbox files written by tests/demo (incl. atomic-write temp and corrupt backups)
+*.tmp
+*.corrupt-*
+outbox*.json
+
+# Logs
+npm-debug.log*
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

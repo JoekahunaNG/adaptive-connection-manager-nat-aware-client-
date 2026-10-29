@@ -1,10 +1,15 @@
+import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
+import { EventCursor } from './eventCursor';
 import { Outbox } from './outbox';
 import {
   AdaptiveConnectionManagerOptions,
   ConnectionMetrics,
   ConnectionState,
+  IntentStatus,
   NetworkQuality,
+  OutboxItem,
+  SendIntentOptions,
   SocketLike,
 } from './types';
 
@@ -21,6 +26,20 @@ const DEFAULTS = {
   heartbeatAckTimeoutMs: 8000,
   baseBackoffMs: 1000,
   maxBackoffMs: 60_000,
+  minPullForwardIntervalMs: 5000,
+  bleProbeIdleFraction: 0.5,
+  bleProbeCooldownMs: 10_000,
+  intentAckDeadlineMs: 5000,
+  eventAckDelayMs: 1000,
+};
+
+// Ack-timeout scaling per reported network quality. A poor 2G/3G link can
+// take seconds to round-trip a healthy heartbeat; waiting the "good" budget
+// there would tear down live connections as false silent drops.
+const ACK_TIMEOUT_MULTIPLIER: Record<NetworkQuality, number> = {
+  good: 1,
+  fair: 1.5,
+  poor: 2.5,
 };
 
 let idCounter = 0;
@@ -73,11 +92,17 @@ export class AdaptiveConnectionManager extends EventEmitter {
       | 'heartbeatAckTimeoutMs'
       | 'baseBackoffMs'
       | 'maxBackoffMs'
+      | 'minPullForwardIntervalMs'
+      | 'bleProbeIdleFraction'
+      | 'bleProbeCooldownMs'
+      | 'intentAckDeadlineMs'
+      | 'eventAckDelayMs'
     >
   >;
   private readonly socketFactory: (url: string) => SocketLike;
   private readonly now: () => number;
   private readonly outbox: Outbox;
+  private readonly eventCursor: EventCursor;
 
   private socket: SocketLike | null = null;
   private state: ConnectionState = 'disconnected';
@@ -92,14 +117,35 @@ export class AdaptiveConnectionManager extends EventEmitter {
   private heartbeatAckTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingHeartbeatId: string | null = null;
   private pendingHeartbeatSentAt = 0;
+  // Only heartbeats sent on the regular schedule (at 70-85% of the learned
+  // timeout) are evidence that the timeout could be longer. Early probes
+  // fire at shorter idle times and must not drive upward probing.
+  private pendingHeartbeatIsScheduled = false;
+  // Captured at send time so a quality change mid-flight can't skew how the
+  // timeout is interpreted.
+  private pendingHeartbeatAckTimeoutMs = 0;
+  private pendingHeartbeatQuality: NetworkQuality = 'good';
+  private currentHeartbeatIntervalMs = 0;
   private lastHeartbeatRttMs: number | null = null;
   private lastActivityAt = 0;
+  private lastBleProbeAt = Number.NEGATIVE_INFINITY;
 
   // --- Reconnect state ---
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private consecutiveFailures = 0;
   private lastSilentDropAt: number | null = null;
+  private lastPullForwardAt = Number.NEGATIVE_INFINITY;
+
+  // --- Per-intent timers, keyed by intent id ---
+  private intentExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private intentAckDeadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  // --- Server event stream ---
+  private eventAckTimer: ReturnType<typeof setTimeout> | null = null;
+  // The cursor we last asked to resume from because of a gap, so one gap
+  // produces one resume request rather than one per out-of-order event.
+  private gapResumeRequestedFor: number | null = null;
 
   // --- Protection / network quality (externally reported) ---
   private protectedMode = false;
@@ -121,11 +167,25 @@ export class AdaptiveConnectionManager extends EventEmitter {
       heartbeatAckTimeoutMs: options.heartbeatAckTimeoutMs ?? DEFAULTS.heartbeatAckTimeoutMs,
       baseBackoffMs: options.baseBackoffMs ?? DEFAULTS.baseBackoffMs,
       maxBackoffMs: options.maxBackoffMs ?? DEFAULTS.maxBackoffMs,
+      minPullForwardIntervalMs: options.minPullForwardIntervalMs ?? DEFAULTS.minPullForwardIntervalMs,
+      bleProbeIdleFraction: options.bleProbeIdleFraction ?? DEFAULTS.bleProbeIdleFraction,
+      bleProbeCooldownMs: options.bleProbeCooldownMs ?? DEFAULTS.bleProbeCooldownMs,
+      intentAckDeadlineMs: options.intentAckDeadlineMs ?? DEFAULTS.intentAckDeadlineMs,
+      eventAckDelayMs: options.eventAckDelayMs ?? DEFAULTS.eventAckDelayMs,
     };
+    this.eventCursor = new EventCursor(options.eventCursorPersistPath ?? null);
     this.learnedIdleTimeoutMs = this.opts.initialIdleTimeoutMs;
     this.now = options.now ?? (() => Date.now());
     this.socketFactory = options.socketFactory ?? this.defaultSocketFactory();
     this.outbox = new Outbox(options.outboxPersistPath ?? null);
+    const backupPath = this.outbox.corruptBackupPath;
+    if (backupPath) {
+      // Deferred so listeners attached right after construction still see it.
+      process.nextTick(() => this.emit('outboxCorrupt', { backupPath }));
+    }
+    // Items reloaded after a restart may have expired while the process was
+    // dead; a 0ms timer fires after the caller has attached listeners.
+    for (const item of this.outbox.all()) this.armExpiry(item);
   }
 
   private defaultSocketFactory(): (url: string) => SocketLike {
@@ -163,7 +223,7 @@ export class AdaptiveConnectionManager extends EventEmitter {
 
   disconnect(): void {
     this.intentionallyClosed = true;
-    this.clearHeartbeatTimers();
+    this.clearConnectionTimers();
     this.clearReconnectTimer();
     this.socket?.close(1000, 'client disconnect');
     this.setState('disconnected');
@@ -194,22 +254,33 @@ export class AdaptiveConnectionManager extends EventEmitter {
   }
 
   /**
-   * Called by the BLE layer when the watch reports liveness (e.g. still on
-   * wrist, still in range). This is a *cheap* signal compared to a full
-   * phone-side heartbeat: it tells us the companion relay path is probably
-   * fine and lets us (a) defer an about-to-fire heartbeat a little rather
-   * than waking the radio twice in quick succession, and (b) treat any
-   * in-flight backoff as lower priority to shorten, since the user is
-   * actively present.
+   * Called by the BLE layer when the watch reports liveness (still on wrist,
+   * still in range). It says the user is present - it says nothing about
+   * the phone's carrier NAT mapping, so it must never postpone a heartbeat:
+   * a frequent liveness signal that deferred heartbeats would starve them
+   * entirely and guarantee an idle-timeout drop.
+   *
+   * What it *does* change is how much a fast failure-detection is worth.
+   * With an engaged user, an intent may be seconds away, so:
+   *  - connected but quiet for a while -> probe now (rate-limited) rather
+   *    than discover a dead path only after the user double-taps;
+   *  - mid-backoff -> pull the reconnect forward (rate-limited).
    */
   notifyBleLiveness(): void {
     this.emit('bleLiveness');
-    if (this.state === 'connected' && this.heartbeatTimer) {
-      // Nudge the next heartbeat out by a small amount rather than fully
-      // resetting it - we still want *some* phone-side confirmation on a
-      // regular cadence, BLE liveness is corroborating evidence, not a
-      // substitute for it.
-      this.rescheduleHeartbeat(this.msUntilNextHeartbeat() + 3000);
+    if (this.state === 'connected') {
+      const now = this.now();
+      const quietFor = now - this.lastActivityAt;
+      const quietThreshold = this.learnedIdleTimeoutMs * this.opts.bleProbeIdleFraction;
+      if (
+        this.pendingHeartbeatId === null &&
+        quietFor >= quietThreshold &&
+        now - this.lastBleProbeAt >= this.opts.bleProbeCooldownMs
+      ) {
+        this.lastBleProbeAt = now;
+        this.clearHeartbeatTimers();
+        this.sendHeartbeat(false);
+      }
     } else if (this.state === 'reconnecting') {
       this.reconnectNow('BLE liveness signal during backoff');
     }
@@ -223,16 +294,24 @@ export class AdaptiveConnectionManager extends EventEmitter {
   /**
    * Enqueue a user intent (e.g. the double-tap "buy") for delivery. Returns
    * immediately once the item is durably queued - delivery and ack happen
-   * asynchronously and are reflected via 'intentQueued' / 'intentAcked'.
+   * asynchronously and are reflected via 'intentQueued' / 'intentAcked' /
+   * 'intentResult' (or 'intentExpired' if `ttlMs` runs out first).
    * This is what makes the double-tap -> transaction path survive a frozen
    * process or a dead connection: the intent is on disk before this method
    * returns, and will be replayed on the next successful connection no
    * matter what happens to the process in between.
+   *
+   * The id is a random UUID: it's the backend's idempotency key, so it must
+   * stay unique across devices and app reinstalls, which a timestamp plus
+   * an in-process counter does not guarantee.
    */
-  sendIntent(payload: unknown): string {
-    const id = nextId('intent');
-    const item = this.outbox.enqueue(id, payload, this.now());
+  sendIntent(payload: unknown, options: SendIntentOptions = {}): string {
+    const id = randomUUID();
+    const now = this.now();
+    const validUntil = options.ttlMs !== undefined ? now + options.ttlMs : null;
+    const item = this.outbox.enqueue(id, payload, now, validUntil);
     this.emit('intentQueued', item);
+    this.armExpiry(item);
     this.flushOutboxItem(item.id);
     return id;
   }
@@ -247,8 +326,9 @@ export class AdaptiveConnectionManager extends EventEmitter {
       outboxSize: this.outbox.size(),
       lastSilentDropAt: this.lastSilentDropAt,
       protectedMode: this.protectedMode,
-      currentHeartbeatIntervalMs: Math.round(this.plannedHeartbeatIntervalMs()),
+      currentHeartbeatIntervalMs: Math.round(this.currentHeartbeatIntervalMs),
       networkQuality: this.networkQuality,
+      lastEventSeq: this.eventCursor.get(),
     };
   }
 
@@ -269,36 +349,37 @@ export class AdaptiveConnectionManager extends EventEmitter {
 
   private handleOpen(): void {
     this.setState('connected');
-    this.reconnectAttempts = 0;
-    this.consecutiveFailures = 0;
     this.lastActivityAt = this.now();
     this.emit('connected');
+    // Resume first, so the backend starts replaying missed events (and any
+    // intent results lost with the last socket) before new intents land.
+    this.gapResumeRequestedFor = null;
+    this.sendResume();
     this.flushAllOutbox();
     this.scheduleHeartbeat();
   }
 
+  private sendResume(): void {
+    this.socket?.send(JSON.stringify({ type: 'resume', lastEventSeq: this.eventCursor.get() }));
+  }
+
   private handleClose(reason: string): void {
-    this.clearHeartbeatTimers();
-    const wasConnected = this.state === 'connected';
+    this.clearConnectionTimers();
     this.socket = null;
     this.emit('disconnected', { reason });
     if (this.intentionallyClosed) {
       this.setState('disconnected');
       return;
     }
-    if (wasConnected) {
-      // A clean close after being connected is *not* evidence about the
-      // idle timeout (we weren't idling out, the server/OS closed us for
-      // some other reason) so we don't feed the EMA here.
-    }
+    // An explicit close is not evidence about the NAT idle timeout (the
+    // server/OS closed us for some other reason), so the EMA isn't fed here.
     this.scheduleReconnect('socket closed: ' + reason);
   }
 
   private handleError(_err: unknown): void {
-    // onerror is typically followed by onclose for real sockets; we let
-    // handleClose drive reconnect to avoid double-scheduling. We still
-    // count it towards failure pressure for backoff sizing.
-    this.consecutiveFailures += 1;
+    // Real sockets always follow onerror with onclose, and handleClose ->
+    // scheduleReconnect does the failure counting; counting here as well
+    // would score one failure twice.
   }
 
   private handleMessage(raw: string): void {
@@ -315,13 +396,85 @@ export class AdaptiveConnectionManager extends EventEmitter {
       return;
     }
     if (msg.type === 'intent-ack' && typeof msg.id === 'string') {
-      const acked = this.outbox.ack(msg.id);
-      if (acked) this.emit('intentAcked', acked);
+      this.settleIntent(msg.id);
+      return;
+    }
+    if (msg.type === 'stream-head' && typeof msg.seq === 'number') {
+      // Reply to a fresh client's resume. Without a cursor, a first event
+      // lost in a drop could never be asked for again.
+      if (this.eventCursor.get() === null) this.eventCursor.set(msg.seq);
+      return;
+    }
+    if (msg.type === 'resync-required' && typeof msg.oldestSeq === 'number') {
+      // Everything before oldestSeq is gone server-side. Move the cursor up
+      // to it so the replay that follows is accepted as contiguous.
+      this.eventCursor.set(msg.oldestSeq - 1);
+      this.emit('resyncRequired', { oldestSeq: msg.oldestSeq });
+      return;
+    }
+    if (typeof msg.seq === 'number') {
+      this.handleSequencedMessage(msg);
+      return;
+    }
+    this.dispatchServerMessage(msg);
+  }
+
+  /**
+   * Server events are stamped with a monotonic `seq`. We accept them strictly
+   * in order: duplicates (a replay overlapping what we already have) are
+   * dropped, and a gap means something was lost, so we ask the backend to
+   * resume from our cursor rather than deliver out of order. A single TCP
+   * connection doesn't reorder, so gaps should only come from server-side
+   * bugs or a racing replay - this is a guard, not the normal path.
+   */
+  private handleSequencedMessage(msg: any): void {
+    const last = this.eventCursor.get();
+    if (last !== null && msg.seq <= last) {
+      this.scheduleEventAck(); // re-ack so the backend stops resending
+      return;
+    }
+    if (last !== null && msg.seq > last + 1) {
+      if (this.gapResumeRequestedFor !== last) {
+        this.gapResumeRequestedFor = last;
+        this.sendResume();
+      }
+      return;
+    }
+    this.dispatchServerMessage(msg);
+    // Advance after dispatch: a crash in between replays this event on
+    // restart instead of losing it (at-least-once).
+    this.eventCursor.set(msg.seq);
+    this.scheduleEventAck();
+  }
+
+  private dispatchServerMessage(msg: any): void {
+    if (msg.type === 'intent-result' && typeof msg.id === 'string') {
+      // A result implies receipt, so it also settles the intent if the
+      // intent-ack itself was lost in flight.
+      this.settleIntent(msg.id);
+      const status: IntentStatus = msg.status === 'executed' ? 'executed' : 'rejected';
+      this.emit('intentResult', {
+        id: msg.id,
+        status,
+        ...(typeof msg.reason === 'string' ? { reason: msg.reason } : {}),
+      });
       return;
     }
     // Anything else is a server-pushed, time-critical event (e.g. "flash
     // sale", "stop-loss triggered") for the watch engagement layer.
     this.emit('event', msg);
+  }
+
+  /** One ack for the highest seq per window, so a burst of events costs one radio write. */
+  private scheduleEventAck(): void {
+    if (this.eventAckTimer) return;
+    this.eventAckTimer = setTimeout(() => {
+      this.eventAckTimer = null;
+      const seq = this.eventCursor.get();
+      if (seq !== null && this.state === 'connected') {
+        this.socket?.send(JSON.stringify({ type: 'event-ack', seq }));
+      }
+    }, this.opts.eventAckDelayMs);
   }
 
   // =========================================================================
@@ -357,31 +510,31 @@ export class AdaptiveConnectionManager extends EventEmitter {
     return Math.max(2000, base - jitter);
   }
 
-  private msUntilNextHeartbeat(): number {
-    return this.plannedHeartbeatIntervalMs();
-  }
-
   private scheduleHeartbeat(): void {
     this.clearHeartbeatTimers();
     const intervalMs = this.plannedHeartbeatIntervalMs();
-    this.heartbeatTimer = setTimeout(() => this.sendHeartbeat(), intervalMs);
+    this.currentHeartbeatIntervalMs = intervalMs;
+    this.heartbeatTimer = setTimeout(() => this.sendHeartbeat(true), intervalMs);
   }
 
-  private rescheduleHeartbeat(inMs: number): void {
-    if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
-    this.heartbeatTimer = setTimeout(() => this.sendHeartbeat(), inMs);
+  private effectiveAckTimeoutMs(): number {
+    return this.opts.heartbeatAckTimeoutMs * ACK_TIMEOUT_MULTIPLIER[this.networkQuality];
   }
 
-  private sendHeartbeat(): void {
-    if (!this.socket || this.state !== 'connected') return;
+  private sendHeartbeat(scheduled: boolean): void {
+    if (!this.socket || this.state !== 'connected' || this.pendingHeartbeatId !== null) return;
+    this.heartbeatTimer = null;
     const id = nextId('hb');
     this.pendingHeartbeatId = id;
+    this.pendingHeartbeatIsScheduled = scheduled;
     this.pendingHeartbeatSentAt = this.now();
+    this.pendingHeartbeatAckTimeoutMs = this.effectiveAckTimeoutMs();
+    this.pendingHeartbeatQuality = this.networkQuality;
     this.socket.send(JSON.stringify({ type: 'heartbeat', id }));
 
     this.heartbeatAckTimer = setTimeout(
       () => this.handleHeartbeatTimeout(),
-      this.opts.heartbeatAckTimeoutMs
+      this.pendingHeartbeatAckTimeoutMs
     );
   }
 
@@ -392,9 +545,16 @@ export class AdaptiveConnectionManager extends EventEmitter {
     }
     this.lastHeartbeatRttMs = this.now() - this.pendingHeartbeatSentAt;
     this.pendingHeartbeatId = null;
+    // A round trip, not a socket open, is what proves the path healthy: a
+    // carrier can accept the TCP handshake and still blackhole the session
+    // seconds later. Resetting backoff on open would let a connect-then-die
+    // loop retry at base delay forever.
     this.consecutiveFailures = 0;
-    this.consecutiveHeartbeatSuccesses += 1;
-    this.maybeProbeTimeoutUpward();
+    this.reconnectAttempts = 0;
+    if (this.pendingHeartbeatIsScheduled) {
+      this.consecutiveHeartbeatSuccesses += 1;
+      this.maybeProbeTimeoutUpward();
+    }
     this.scheduleHeartbeat();
   }
 
@@ -404,16 +564,26 @@ export class AdaptiveConnectionManager extends EventEmitter {
    * onclose/onerror, just silence. We treat the elapsed idle time as
    * evidence of an upper bound on the true timeout and adjust down via EMA,
    * then force the dead socket closed and reconnect.
+   *
+   * Exception: on a 'poor' link a missing ack is at least as likely to be
+   * packet loss as NAT eviction. We still reconnect (the path is unusable
+   * either way) but don't feed the EMA, or every lossy stretch would ratchet
+   * the learned timeout down and cost battery for no NAT benefit.
    */
   private handleHeartbeatTimeout(): void {
     const idleFor = this.now() - this.lastActivityAt;
-    this.emit('heartbeatTimeout', { intervalMs: idleFor });
+    const usedForLearning = this.pendingHeartbeatQuality !== 'poor';
+    this.emit('heartbeatTimeout', {
+      intervalMs: idleFor,
+      ackTimeoutMs: this.pendingHeartbeatAckTimeoutMs,
+      usedForLearning,
+    });
     this.consecutiveHeartbeatSuccesses = 0;
     this.lastSilentDropAt = this.now();
-    this.learnIdleTimeoutDown(idleFor);
+    if (usedForLearning) this.learnIdleTimeoutDown(idleFor);
 
     this.pendingHeartbeatId = null;
-    this.clearHeartbeatTimers();
+    this.clearConnectionTimers();
     // The socket object is still technically "open" from the transport's
     // point of view (that's what makes this a silent drop) - force it
     // closed so we don't leak it. We detach its callbacks first: closing it
@@ -444,7 +614,7 @@ export class AdaptiveConnectionManager extends EventEmitter {
     // timeout, not network timeout + our grace period.
     const inferredCeiling = Math.max(
       this.opts.minIdleTimeoutMs,
-      observedMs - this.opts.heartbeatAckTimeoutMs
+      observedMs - this.pendingHeartbeatAckTimeoutMs
     );
     const alpha = this.opts.emaAlphaDown;
     const next = clamp(
@@ -487,6 +657,17 @@ export class AdaptiveConnectionManager extends EventEmitter {
     }
   }
 
+  /** Everything tied to the current socket; called whenever that socket goes away. */
+  private clearConnectionTimers(): void {
+    this.clearHeartbeatTimers();
+    this.clearIntentAckDeadlines();
+    if (this.eventAckTimer) {
+      // The next resume carries the cursor, which acks implicitly.
+      clearTimeout(this.eventAckTimer);
+      this.eventAckTimer = null;
+    }
+  }
+
   private clearHeartbeatTimers(): void {
     if (this.heartbeatTimer) {
       clearTimeout(this.heartbeatTimer);
@@ -524,9 +705,18 @@ export class AdaptiveConnectionManager extends EventEmitter {
     return Math.round(Math.random() * exp);
   }
 
-  /** Jump the reconnect timer to "now" - used by protect()/notifyBleLiveness() to shorten a wait we now have reason to believe is unnecessary. */
+  /**
+   * Jump the reconnect timer to "now" - used by protect()/notifyBleLiveness()
+   * when an engaged user makes a fast reconnect worth an extra radio wake-up.
+   * Rate-limited: during a real outage the watch keeps reporting liveness,
+   * and honoring every signal would turn backoff into a reconnect storm.
+   * Within the cooldown the normal backoff timer is left to run.
+   */
   private reconnectNow(_reason: string): void {
     if (this.state !== 'reconnecting') return;
+    const now = this.now();
+    if (now - this.lastPullForwardAt < this.opts.minPullForwardIntervalMs) return;
+    this.lastPullForwardAt = now;
     this.clearReconnectTimer();
     this.openSocket();
   }
@@ -550,10 +740,76 @@ export class AdaptiveConnectionManager extends EventEmitter {
 
   private flushOutboxItem(id: string): void {
     if (this.state !== 'connected' || !this.socket) return;
-    const item = this.outbox.all().find((i) => i.id === id);
+    const item = this.outbox.get(id);
     if (!item) return;
+    // Its expiry timer may not have fired yet (timers are coarse, and a
+    // process thawed from a freeze runs queued callbacks late).
+    if (item.validUntil !== null && this.now() >= item.validUntil) {
+      this.expireIntent(id);
+      return;
+    }
     this.outbox.markAttempt(id, this.now());
-    this.socket.send(JSON.stringify({ type: 'intent', id: item.id, payload: item.payload }));
+    this.socket.send(
+      JSON.stringify({ type: 'intent', id: item.id, payload: item.payload, validUntil: item.validUntil })
+    );
+    this.armAckDeadline(id);
+  }
+
+  /**
+   * An unacked intent is the most latency-sensitive thing in the system, so
+   * it shouldn't have to wait for the next scheduled heartbeat to find out
+   * the path is dead. If the ack is late, probe immediately: a healthy path
+   * acks the heartbeat and the intent ack was just slow; a dead one fails
+   * the heartbeat, reconnects, and replays the intent.
+   */
+  private armAckDeadline(id: string): void {
+    this.clearTimer(this.intentAckDeadlineTimers, id);
+    this.intentAckDeadlineTimers.set(
+      id,
+      setTimeout(() => {
+        this.intentAckDeadlineTimers.delete(id);
+        if (!this.outbox.get(id) || this.pendingHeartbeatId !== null) return;
+        this.clearHeartbeatTimers();
+        this.sendHeartbeat(false);
+      }, this.opts.intentAckDeadlineMs)
+    );
+  }
+
+  private armExpiry(item: OutboxItem): void {
+    if (item.validUntil === null) return;
+    const timer = setTimeout(() => this.expireIntent(item.id), Math.max(0, item.validUntil - this.now()));
+    // An intent waiting to expire shouldn't on its own keep the process alive.
+    timer.unref?.();
+    this.intentExpiryTimers.set(item.id, timer);
+  }
+
+  private expireIntent(id: string): void {
+    this.clearTimer(this.intentExpiryTimers, id);
+    this.clearTimer(this.intentAckDeadlineTimers, id);
+    const item = this.outbox.remove(id);
+    if (item) this.emit('intentExpired', item);
+  }
+
+  /** The backend has the intent (ack or result): stop retrying and stop its timers. */
+  private settleIntent(id: string): void {
+    this.clearTimer(this.intentExpiryTimers, id);
+    this.clearTimer(this.intentAckDeadlineTimers, id);
+    const acked = this.outbox.remove(id);
+    if (acked) this.emit('intentAcked', acked);
+  }
+
+  private clearIntentAckDeadlines(): void {
+    // Re-armed per item when the outbox is replayed on the next connect.
+    for (const timer of this.intentAckDeadlineTimers.values()) clearTimeout(timer);
+    this.intentAckDeadlineTimers.clear();
+  }
+
+  private clearTimer(timers: Map<string, ReturnType<typeof setTimeout>>, id: string): void {
+    const timer = timers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      timers.delete(id);
+    }
   }
 
   // =========================================================================

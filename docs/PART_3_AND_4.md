@@ -11,7 +11,7 @@ Production logs from Lagos and Nairobi show:
 ## 1) Most likely root causes
 
 **Heartbeats succeed 2-3 min, then silently die.**
-Two candidate causes, not mutually exclusive:
+Three candidate causes, not mutually exclusive:
 - The real NAT/carrier idle timeout for this path is roughly in the
   2-3 minute band, and if the client was still using a pre-adaptive or
   too-loosely-scheduled heartbeat, the margin wasn't tight enough to land a
@@ -23,6 +23,14 @@ Two candidate causes, not mutually exclusive:
   Doze-exempt alarm, the OS can silently *defer* the heartbeat itself,
   which looks identical from the client's point of view to "the heartbeat
   fired but got no ack."
+- Self-inflicted, by an adaptive client like the one in Part 2: after a run
+  of clean heartbeats the EMA probes the learned timeout *upward*. If the
+  true timeout sits just above where heartbeats currently land, a few
+  minutes of successes push the interval past it, the next heartbeat
+  arrives after eviction, and the client tightens again - a repeating
+  "works for a few minutes, then drops" sawtooth. The diagnostics below
+  distinguish it: drops cluster right after an upward
+  `idleTimeoutLearned` event.
 
 **Events delayed 4-15 minutes after process death.**
 This range is a strong signature of Doze/App-Standby **maintenance-window
@@ -88,7 +96,14 @@ A structured, periodically-uploaded event log (not just error logs) with:
   itself trigger an immediate heartbeat probe/reconnect rather than waiting
   for the regularly scheduled one. This directly targets the >8s cases,
   which are currently bottlenecked on heartbeat cadence rather than actual
-  network recovery time.
+  network recovery time. *(Implemented in Part 2: `intentAckDeadlineMs`,
+  default 5s. Pair it with a shorter heartbeat ack timeout while an intent
+  is outstanding, since the probe's own wait adds to the total.)*
+- **Stop the probe sawtooth.** Remember the learned value at which an
+  upward probe last failed, and treat it as a ceiling that later probes
+  approach more slowly (or not at all for some hours on that network). The
+  battery saved by probing past a known-bad ceiling is far smaller than
+  the cost of a silent drop every few minutes.
 - **Use high-priority FCM data messages, not periodic jobs, for
   time-critical event wake-ups**, and take a short bounded wakelock on
   receipt so the reconnect-and-flush sequence can't be re-suspended by Doze
@@ -96,7 +111,9 @@ A structured, periodically-uploaded event log (not just error logs) with:
 - **Let BLE liveness proactively trigger a phone-side health check**, not
   just pull a pending reconnect forward: if the watch is reporting active
   liveness but the phone hasn't heartbeated recently, that's itself reason
-  to probe immediately rather than wait.
+  to probe immediately rather than wait. *(Implemented in Part 2: a quiet
+  connection is probed on liveness, rate-limited, and liveness never
+  postpones a scheduled heartbeat.)*
 - **Detect known-aggressive OEM builds by manufacturer/model** and, on
   first run (and periodically thereafter), explicitly guide the user
   through the vendor-specific auto-start/background permission flow, since
@@ -182,6 +199,9 @@ all the same NAT/battery problems on a second, more constrained device.
   learned-timeout and OEM-freeze-pattern statistics back into better
   per-device-model defaults shipped via remote config, so the fleet
   collectively gets smarter rather than each device learning from scratch.
+  On-device, key the learned timeout by network (the Part 2 reference keeps
+  one value per instance, so every wifi <-> cellular handoff re-learns from
+  the wrong starting point).
 - **Capacity planning:** with heavy 2G/3G mix, connection *churn*
   (handoffs, drops, reconnects) will dominate backend load more than
   steady-state message volume - size and load-test for churn-per-second,

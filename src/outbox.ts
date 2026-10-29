@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { writeFileAtomicSync } from './fsUtil';
 import { OutboxItem } from './types';
 
 /**
@@ -20,42 +21,57 @@ import { OutboxItem } from './types';
 export class Outbox {
   private items: Map<string, OutboxItem> = new Map();
   private readonly persistPath: string | null;
+  /**
+   * Set when the persisted file existed but could not be parsed. The bad
+   * file is moved aside (never deleted) so its intents can be recovered or
+   * at least diagnosed, and the owner can surface this instead of the
+   * queue silently coming back empty.
+   */
+  readonly corruptBackupPath: string | null;
 
   constructor(persistPath: string | null = null) {
     this.persistPath = persistPath;
-    this.load();
+    this.corruptBackupPath = this.load();
   }
 
-  private load(): void {
-    if (!this.persistPath) return;
+  private load(): string | null {
+    if (!this.persistPath || !fs.existsSync(this.persistPath)) return null;
     try {
-      if (fs.existsSync(this.persistPath)) {
-        const raw = fs.readFileSync(this.persistPath, 'utf-8');
-        const parsed: OutboxItem[] = JSON.parse(raw);
-        for (const item of parsed) {
-          this.items.set(item.id, item);
-        }
+      const parsed: unknown = JSON.parse(fs.readFileSync(this.persistPath, 'utf-8'));
+      if (!Array.isArray(parsed)) throw new Error('outbox file is not an array');
+      for (const item of parsed as OutboxItem[]) {
+        // Files written before validUntil existed have no such field.
+        this.items.set(item.id, { ...item, validUntil: item.validUntil ?? null });
       }
+      return null;
     } catch {
-      // Corrupt or partial write (e.g. process died mid-write). Starting
-      // empty is safer than throwing - we'd rather lose a queued intent
-      // (user can redo the double-tap) than crash the connection manager
-      // on every startup.
+      // persist() replaces the file atomically, so a crash mid-write can't
+      // produce this - only disk corruption or a foreign write can. Keep
+      // the evidence rather than overwriting it on the next enqueue.
+      const backup = `${this.persistPath}.corrupt-${Date.now()}`;
+      try {
+        fs.renameSync(this.persistPath, backup);
+      } catch {
+        return null;
+      }
+      return backup;
     }
   }
 
+  /** Atomic replace (see writeFileAtomicSync), so a crash mid-write can't lose every queued intent. */
   private persist(): void {
     if (!this.persistPath) return;
     try {
-      fs.writeFileSync(this.persistPath, JSON.stringify(Array.from(this.items.values())), 'utf-8');
+      writeFileAtomicSync(this.persistPath, JSON.stringify(Array.from(this.items.values())));
     } catch {
-      // Best-effort; a failed persist here just means a smaller crash
-      // window, not a correctness bug, since we still hold it in memory.
+      // The previous complete file is still intact on disk and the item is
+      // still held in memory, so a failed persist narrows durability for
+      // this one change rather than corrupting existing state.
     }
   }
 
-  enqueue(id: string, payload: unknown, now: number): OutboxItem {
-    const item: OutboxItem = { id, payload, enqueuedAt: now, attempts: 0, lastAttemptAt: null };
+  enqueue(id: string, payload: unknown, now: number, validUntil: number | null = null): OutboxItem {
+    const item: OutboxItem = { id, payload, enqueuedAt: now, validUntil, attempts: 0, lastAttemptAt: null };
     this.items.set(id, item);
     this.persist();
     return item;
@@ -69,12 +85,21 @@ export class Outbox {
     this.persist();
   }
 
-  ack(id: string): OutboxItem | null {
+  /** Remove an item (acked or expired). Returns it, or null if it was already gone. */
+  remove(id: string): OutboxItem | null {
     const item = this.items.get(id);
     if (!item) return null;
     this.items.delete(id);
     this.persist();
     return item;
+  }
+
+  ack(id: string): OutboxItem | null {
+    return this.remove(id);
+  }
+
+  get(id: string): OutboxItem | null {
+    return this.items.get(id) ?? null;
   }
 
   all(): OutboxItem[] {

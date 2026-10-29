@@ -1,9 +1,10 @@
+import { SimulatedBackend } from './simulatedBackend';
 import { SocketLike, SocketCloseInfo, SocketMessageInfo } from './types';
 
 export type SimulatedCondition = 'good' | 'fair' | 'poor' | 'nat-flushed';
 
 /**
- * A deterministic, controllable fake transport used by the demo and tests.
+ * A controllable fake transport used by the demo and tests.
  *
  * This exists so we can *prove* adaptive behaviour (learning a NAT timeout,
  * backing off, recovering) without a real flaky network or a real 2-5 minute
@@ -36,13 +37,17 @@ export class SimulatedSocket implements SocketLike {
   private lastActivityAt: number;
   private idleCheckTimer: ReturnType<typeof setInterval> | null = null;
 
+  /** When set, sequenced events, resume and intent processing go through this shared backend. */
+  private readonly backend: SimulatedBackend | null;
+
   constructor(
     _url: string,
-    opts: { trueIdleTimeoutMs?: number; log?: (msg: string) => void } = {}
+    opts: { trueIdleTimeoutMs?: number; log?: (msg: string) => void; backend?: SimulatedBackend } = {}
   ) {
     this.trueIdleTimeoutMs = opts.trueIdleTimeoutMs ?? 150_000; // 2.5 min, mid-range of 30s-5min
     this.lastActivityAt = Date.now();
     this.log = opts.log ?? (() => {});
+    this.backend = opts.backend ?? null;
 
     // "Connect" asynchronously, like a real socket.
     setTimeout(() => {
@@ -86,14 +91,37 @@ export class SimulatedSocket implements SocketLike {
     }, latency);
   }
 
-  /** Simple echo/ack protocol: heartbeats get ack'd, intents get ack'd, anything else is echoed as an "event". */
+  /**
+   * Minimal backend protocol: heartbeats get a heartbeat-ack. Intents get an
+   * immediate intent-ack ("durably received") and, a moment later, an
+   * intent-result - 'rejected' with reason 'expired' if the intent arrived
+   * after its validUntil, otherwise 'executed'. With a SimulatedBackend
+   * attached, resume/event-ack are honoured and intent results are
+   * sequenced events; without one, results are sent unsequenced.
+   */
   private respond(data: string): void {
     try {
       const msg = JSON.parse(data);
       if (msg.type === 'heartbeat') {
         this.deliver({ type: 'heartbeat-ack', id: msg.id, serverTime: Date.now() });
+      } else if (msg.type === 'resume') {
+        this.backend?.handleResume(this, msg.lastEventSeq ?? null);
+      } else if (msg.type === 'event-ack') {
+        if (typeof msg.seq === 'number') this.backend?.handleEventAck(msg.seq);
+      } else if (msg.type === 'intent' && this.backend) {
+        this.deliver({ type: 'intent-ack', id: msg.id });
+        this.backend.handleIntent(msg, this.currentLatencyMs());
       } else if (msg.type === 'intent') {
         this.deliver({ type: 'intent-ack', id: msg.id });
+        const expired = typeof msg.validUntil === 'number' && Date.now() > msg.validUntil;
+        setTimeout(() => {
+          if (!this.alive || this.blackholed) return;
+          this.deliver(
+            expired
+              ? { type: 'intent-result', id: msg.id, status: 'rejected', reason: 'expired' }
+              : { type: 'intent-result', id: msg.id, status: 'executed' }
+          );
+        }, this.currentLatencyMs());
       }
     } catch {
       // ignore malformed
@@ -104,11 +132,20 @@ export class SimulatedSocket implements SocketLike {
     this.onmessage?.({ data: JSON.stringify(obj) });
   }
 
-  /** Push a server-initiated event in, as if the backend emitted one (e.g. "flash sale"). */
+  /**
+   * Push an unsequenced server event straight down this socket. Lost for
+   * good if the socket is dead - use SimulatedBackend.publish() for events
+   * that must survive a reconnect.
+   */
   pushServerEvent(payload: unknown): void {
+    this.deliverFromServer(payload);
+  }
+
+  /** Server -> client delivery; silently lost if the mapping is dead, like a real NAT drop. */
+  deliverFromServer(message: unknown): void {
     if (!this.alive || this.blackholed) return;
     this.lastActivityAt = Date.now();
-    this.deliver(payload);
+    this.deliver(message);
   }
 
   close(_code?: number, reason?: string): void {
