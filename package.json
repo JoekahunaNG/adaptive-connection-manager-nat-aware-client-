@@ -1,0 +1,23 @@
+{
+  "name": "clockit-adaptive-connection-manager",
+  "version": "1.0.0",
+  "description": "Clockit Senior Software Engineer Assessment - Adaptive WebSocket connection manager for hostile mobile networks",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc",
+    "demo": "ts-node src/demo.ts",
+    "test": "ts-node test/connectionManager.test.ts"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "ts-node": "^10.9.2",
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
